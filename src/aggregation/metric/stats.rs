@@ -326,11 +326,11 @@ impl<const COLUMN_TYPE_ID: u8> SegmentAggregationCollector
                 self.missing_u64,
             );
         }
-        collect_stats::<COLUMN_TYPE_ID>(
+        collect_stats_slice::<COLUMN_TYPE_ID>(
             &mut self.buckets[parent_bucket_id as usize],
-            agg_data.column_block_accessor.iter_vals(),
+            agg_data.column_block_accessor.values(),
             self.is_number_or_date_type,
-        )?;
+        );
 
         Ok(())
     }
@@ -380,6 +380,49 @@ impl<const COLUMN_TYPE_ID: u8> SegmentAggregationCollector
             "avg" if stats.count > 0 => Some(stats.sum / stats.count as f64),
             _ => None,
         }
+    }
+}
+
+/// Collects a block of values into `LANES` independent Kahan accumulators merged back into
+/// `stats`, breaking the serial dependency chain of [`IntermediateStats::collect`].
+#[inline]
+fn collect_stats_slice<const COLUMN_TYPE_ID: u8>(
+    stats: &mut IntermediateStats,
+    vals: &[u64],
+    is_number_or_date_type: bool,
+) {
+    if !is_number_or_date_type {
+        // Non-numeric: only the presence of a value matters, as if collecting `0.0` for each.
+        if !vals.is_empty() {
+            stats.count += vals.len() as u64;
+            stats.min = stats.min.min(0.0);
+            stats.max = stats.max.max(0.0);
+        }
+        return;
+    }
+    const LANES: usize = 4;
+
+    // Below two values per lane, the setup and merge overhead outweighs the gain.
+    if vals.len() < LANES * 2 {
+        for &val in vals {
+            stats.collect(convert_to_f64::<COLUMN_TYPE_ID>(val));
+        }
+        return;
+    }
+    let mut lanes: [IntermediateStats; LANES] = Default::default();
+
+    let (chunks, remainder) = vals.as_chunks::<LANES>();
+
+    for chunk in chunks {
+        for lane in 0..LANES {
+            lanes[lane].collect(convert_to_f64::<COLUMN_TYPE_ID>(chunk[lane]));
+        }
+    }
+    for &val in remainder {
+        lanes[0].collect(convert_to_f64::<COLUMN_TYPE_ID>(val));
+    }
+    for lane in lanes {
+        stats.merge_fruits(lane);
     }
 }
 
@@ -487,6 +530,51 @@ mod tests {
                 "sum": 10.0
             })
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_aggregation_stats_block() -> crate::Result<()> {
+        // Enough values in a single segment to go through `collect_stats_slice`'s lanes, with a
+        // non-empty remainder holding the max.
+        let values = vec![3.0, -7.0, 5.0, 1.0, 9.0, 2.0, 8.0, 4.0, 6.0, 42.0];
+
+        let index = get_test_index_from_values(true, &values)?;
+
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "stats": {
+                "stats": {
+                    "field": "score_f64",
+                },
+            },
+            "count_str": {
+                "value_count": {
+                    "field": "string_id",
+                },
+            }
+        }))
+        .unwrap();
+
+        let collector = AggregationCollector::from_aggs(agg_req, Default::default());
+
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let agg_res: AggregationResults = searcher.search(&AllQuery, &collector).unwrap();
+
+        let res: Value = serde_json::from_str(&serde_json::to_string(&agg_res)?)?;
+        assert_eq!(
+            res["stats"],
+            json!({
+                "avg": 7.3,
+                "count": 10,
+                "max": 42.0,
+                "min": -7.0,
+                "sum": 73.0
+            })
+        );
+        // Non-numeric column: only the presence of values is collected.
+        assert_eq!(res["count_str"], json!({ "value": 10.0 }));
 
         Ok(())
     }

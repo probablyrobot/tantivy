@@ -227,11 +227,16 @@ impl IntermediateExtendedStats {
                 * self.intermediate_stats.count as f64
                 * other.intermediate_stats.count as f64
                 / new_count as f64;
-        self.mean = (self.intermediate_stats.sum + other.intermediate_stats.sum) / new_count as f64;
-        self.sum_of_squares_elastic += other.sum_of_squares_elastic;
-        self.delta_sum_for_squares_elastic += other.delta_sum_for_squares_elastic;
+        // kahan algorithm for sum_of_squares_elastic
+        let y = other.sum_of_squares_elastic
+            - (self.delta_sum_for_squares_elastic + other.delta_sum_for_squares_elastic);
+        let t = self.sum_of_squares_elastic + y;
+        self.delta_sum_for_squares_elastic = (t - self.sum_of_squares_elastic) - y;
+        self.sum_of_squares_elastic = t;
         self.intermediate_stats
             .merge_fruits(other.intermediate_stats);
+        // Derive the mean from the compensated sum so `avg` stays consistent with `sum / count`.
+        self.mean = self.intermediate_stats.sum / new_count as f64;
     }
 
     /// Computes the final stats value.
@@ -315,6 +320,38 @@ impl IntermediateExtendedStats {
         self.sum_of_squares_elastic = t;
         self.update_variance(value);
     }
+
+    /// Collects a block of values into `LANES` independent accumulators combined with
+    /// [`Self::merge_fruits`], breaking the serial dependency chain of [`Self::collect`].
+    #[inline]
+    fn collect_block(&mut self, vals: &[u64], field_type: ColumnType) {
+        const LANES: usize = 4;
+
+        // Below two values per lane, the setup and merge overhead outweighs the gain.
+        if vals.len() < LANES * 2 {
+            for &val in vals {
+                self.collect(f64_from_fastfield_u64(val, field_type));
+            }
+            return;
+        }
+        // The lanes must carry `self.sigma`: `merge_fruits` replaces an empty `self` wholesale.
+        let mut lanes: [IntermediateExtendedStats; LANES] =
+            std::array::from_fn(|_| Self::with_sigma(Some(self.sigma)));
+
+        let (chunks, remainder) = vals.as_chunks::<LANES>();
+
+        for chunk in chunks {
+            for lane in 0..LANES {
+                lanes[lane].collect(f64_from_fastfield_u64(chunk[lane], field_type));
+            }
+        }
+        for &val in remainder {
+            lanes[0].collect(f64_from_fastfield_u64(val, field_type));
+        }
+        for lane in lanes {
+            self.merge_fruits(lane);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -377,10 +414,7 @@ impl SegmentAggregationCollector for SegmentExtendedStatsCollector {
             self.missing,
         );
         let field_type = self.accessor.column_type();
-        for val in agg_data.column_block_accessor.iter_vals() {
-            let val1 = f64_from_fastfield_u64(val, field_type);
-            extended_stats.collect(val1);
-        }
+        extended_stats.collect_block(agg_data.column_block_accessor.values(), field_type);
 
         // store back
         self.buckets[parent_bucket_id as usize] = extended_stats;
@@ -672,6 +706,52 @@ mod tests {
                 .get_value_from_aggregation("my_stats", "variance_sampling")?
                 .unwrap(),
             10.966666666666663,
+            EPSILON_FOR_TEST
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_aggregation_extended_stats_with_sigma_block() -> crate::Result<()> {
+        // Enough values in a single segment to go through `collect_block`'s lanes.
+        let values: Vec<f64> = (1..=10).map(|val| val as f64).collect();
+
+        let index = get_test_index_from_values(true, &values)?;
+
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "my_stats": {
+                "extended_stats": {
+                    "field": "score_f64",
+                    "sigma": 1.5
+                },
+            }
+        }))
+        .unwrap();
+
+        let collector = AggregationCollector::from_aggs(agg_req, Default::default());
+
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let agg_res: AggregationResults = searcher.search(&AllQuery, &collector).unwrap();
+
+        let get = |prop: &str| {
+            agg_res
+                .get_value_from_aggregation("my_stats", prop)
+                .unwrap()
+                .unwrap()
+        };
+        assert_eq!(get("count"), 10.0);
+        assert_eq!(get("min"), 1.0);
+        assert_eq!(get("max"), 10.0);
+        assert_eq!(get("sum"), 55.0);
+        assert_nearly_equals!(get("avg"), 5.5, EPSILON_FOR_TEST);
+        assert_nearly_equals!(get("sum_of_squares"), 385.0, EPSILON_FOR_TEST);
+        assert_nearly_equals!(get("variance_population"), 8.25, EPSILON_FOR_TEST);
+        assert_nearly_equals!(get("variance_sampling"), 82.5 / 9.0, EPSILON_FOR_TEST);
+        assert_nearly_equals!(
+            get("std_deviation_bounds.upper"),
+            5.5 + 1.5 * 8.25f64.sqrt(),
             EPSILON_FOR_TEST
         );
 
